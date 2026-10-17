@@ -733,8 +733,93 @@ export async function fetchConfessions({ day = 'today', date = null, category = 
   const isModerator = currentUser && currentUser.role === 'admin';
   const myPostIds = getMyCreatedPostIds();
 
-  // 1. Try Firebase Firestore if configured
-  if (isFirebaseConfigured) {
+  const isLocalhost = typeof window !== 'undefined' && (
+    window.location.hostname === 'localhost' ||
+    window.location.hostname === '127.0.0.1' ||
+    window.location.hostname === '0.0.0.0' ||
+    window.location.hostname.endsWith('.local')
+  );
+
+  // 1. ON LOCALHOST: Prioritize local dev environment (MongoDB API + localStorage)
+  if (isLocalhost) {
+    let localApiPosts = [];
+    try {
+      const apiRes = await api.getConfessions({
+        day: date || (day === 'this_week' ? 'all' : day),
+        category: category === 'all' ? undefined : category,
+        search: searchQuery
+      });
+      if (apiRes && apiRes.success && Array.isArray(apiRes.data) && apiRes.data.length > 0) {
+        localApiPosts = apiRes.data;
+      }
+    } catch (err) {
+      // Local Express server may be offline
+    }
+
+    // Always merge with localStorage so locally created confessions NEVER disappear on reload
+    const stored = getStoredConfessions();
+    const mergedMap = new Map();
+
+    // 1. Add locally created / saved posts from localStorage
+    stored.forEach(p => {
+      if (p && p.id) {
+        mergedMap.set(p.id, p);
+      }
+    });
+
+    // 2. Overlay / merge any posts from local MongoDB API
+    localApiPosts.forEach(p => {
+      if (p && p.id) {
+        mergedMap.set(p.id, p);
+      }
+    });
+
+    const combined = Array.from(mergedMap.values());
+    let filtered = combined.filter(c => c.status === 'published' || !c.status);
+
+    if (date) {
+      filtered = filtered.filter(c => c.date_key === date);
+    } else if (day === 'this_week') {
+      const weekDates = ['2026-10-16', '2026-10-15', '2026-10-14', '2026-10-13', '2026-10-12'];
+      filtered = filtered.filter(c => weekDates.includes(c.date_key) || c.day_key === 'today' || c.day_key === 'yesterday');
+    } else if (day && day !== 'all') {
+      filtered = filtered.filter(c => c.day_key === day || c.date_key === day);
+    }
+
+    if (category && category.toLowerCase() !== 'all') {
+      filtered = filtered.filter(c => c.category && c.category.toLowerCase() === category.toLowerCase());
+    }
+
+    if (searchQuery && searchQuery.trim()) {
+      const q = searchQuery.toLowerCase().trim();
+      filtered = filtered.filter(c => 
+        (c.body && c.body.toLowerCase().includes(q)) ||
+        (c.to_target && c.to_target.toLowerCase().includes(q)) ||
+        (c.category && c.category.toLowerCase().includes(q)) ||
+        (c.confession_number && c.confession_number.toLowerCase().includes(q))
+      );
+    }
+
+    return filtered.map((c, idx) => {
+      const isAuthor = myPostIds.includes(c.id) || (currentUser && (c.author_id === currentUser.id || c.real_author_name === currentUser.name || c.real_author_email === currentUser.email));
+      const canDelete = Boolean(isModerator || isAuthor);
+
+      return {
+        ...c,
+        is_liked: Boolean(likesMap[c.id]),
+        is_saved: Boolean(savedMap[c.id]),
+        is_own: isAuthor,
+        can_delete: canDelete,
+        content: c.body || c.content,
+        title: c.to_target || (c.body ? c.body.substring(0, 40) + '...' : 'Confession'),
+        post_number_formatted: c.confession_number,
+        post_number: parseInt(c.confession_number?.replace(/\D/g, '') || '0', 10)
+      };
+    });
+  }
+
+  // 2. IN PRODUCTION: Query Firebase Firestore if configured
+  if (isFirebaseConfigured && !isLocalhost) {
     try {
       const fsConfessions = await firestoreService.getConfessions({ day, category, search: searchQuery });
       if (fsConfessions && fsConfessions.length > 0) {
@@ -754,37 +839,6 @@ export async function fetchConfessions({ day = 'today', date = null, category = 
         });
       }
     } catch (e) {}
-  }
-
-  // 2. Try Express & MongoDB API
-  try {
-    const apiRes = await api.getConfessions({
-      day: date || (day === 'this_week' ? 'all' : day),
-      category: category === 'all' ? undefined : category,
-      search: searchQuery
-    });
-    if (apiRes && apiRes.success && Array.isArray(apiRes.data) && apiRes.data.length > 0) {
-      let results = apiRes.data;
-      if (date) {
-        results = results.filter(c => c.date_key === date);
-      }
-      return results.map(c => {
-        const isAuthor = myPostIds.includes(c.id) || (currentUser && c.author_id === currentUser.id);
-        return {
-          ...c,
-          is_liked: Boolean(likesMap[c.id]),
-          is_saved: Boolean(savedMap[c.id]),
-          is_own: isAuthor,
-          can_delete: Boolean(isModerator || isAuthor),
-          content: c.body,
-          title: c.to_target || (c.body ? c.body.substring(0, 40) + '...' : 'Confession'),
-          post_number_formatted: c.confession_number,
-          post_number: parseInt(c.confession_number?.replace(/\D/g, '') || '0', 10)
-        };
-      });
-    }
-  } catch (err) {
-    // Graceful fallback to local storage
   }
 
   // 2. Local Fallback
